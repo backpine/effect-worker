@@ -1,17 +1,20 @@
 import { Context, Effect, Layer, Option } from "effect"
 import { Schema } from "effect"
-import { CloudflareBindings } from "./bindings"
+import { CloudflareEnv } from "./cloudflare"
 import { KVError } from "@/errors"
 import type { KVBindingName } from "./types"
 
 /**
  * Operations available on a KV namespace
+ *
+ * IMPORTANT: Methods require CloudflareEnv to be provided in the context.
+ * This is provided per-request via Context.make(CloudflareEnv, { env }).
  */
 export interface KVOperations {
   /**
    * Get a value by key
    */
-  readonly get: (key: string) => Effect.Effect<Option.Option<string>, KVError>
+  readonly get: (key: string) => Effect.Effect<Option.Option<string>, KVError, CloudflareEnv>
 
   /**
    * Get a JSON value with schema validation
@@ -19,7 +22,7 @@ export interface KVOperations {
   readonly getJson: <A, I, R>(
     key: string,
     schema: Schema.Schema<A, I, R>
-  ) => Effect.Effect<Option.Option<A>, KVError, R>
+  ) => Effect.Effect<Option.Option<A>, KVError, CloudflareEnv | R>
 
   /**
    * Get a value with metadata
@@ -27,7 +30,7 @@ export interface KVOperations {
   readonly getWithMetadata: <A, I, R>(
     key: string,
     schema: Schema.Schema<A, I, R>
-  ) => Effect.Effect<Option.Option<{ value: string; metadata: A }>, KVError, R>
+  ) => Effect.Effect<Option.Option<{ value: string; metadata: A }>, KVError, CloudflareEnv | R>
 
   /**
    * Set a value
@@ -40,7 +43,7 @@ export interface KVOperations {
       expiration?: number
       metadata?: unknown
     }
-  ) => Effect.Effect<void, KVError>
+  ) => Effect.Effect<void, KVError, CloudflareEnv>
 
   /**
    * Set a JSON value
@@ -52,12 +55,12 @@ export interface KVOperations {
       expirationTtl?: number
       expiration?: number
     }
-  ) => Effect.Effect<void, KVError>
+  ) => Effect.Effect<void, KVError, CloudflareEnv>
 
   /**
    * Delete a key
    */
-  readonly delete: (key: string) => Effect.Effect<void, KVError>
+  readonly delete: (key: string) => Effect.Effect<void, KVError, CloudflareEnv>
 
   /**
    * List keys with optional prefix
@@ -66,7 +69,7 @@ export interface KVOperations {
     prefix?: string
     limit?: number
     cursor?: string
-  }) => Effect.Effect<{ keys: Array<{ name: string }>; cursor?: string }, KVError>
+  }) => Effect.Effect<{ keys: Array<{ name: string }>; cursor?: string }, KVError, CloudflareEnv>
 }
 
 /**
@@ -97,23 +100,31 @@ export interface KVService {
 export class KV extends Context.Tag("KV")<KV, KVService>() {}
 
 /**
- * Create KV operations for a specific namespace
+ * Create KV operations for a specific namespace.
+ *
+ * IMPORTANT: Each method accesses CloudflareEnv at CALL time, not construction time.
+ * This allows the layer to be built once while still accessing request-specific env.
  */
-const makeKVOperations = (
-  kv: KVNamespace,
-  bindingName: string
-): KVOperations => {
+const makeKVOperations = (bindingName: KVBindingName): KVOperations => {
+  const getKV = Effect.gen(function* () {
+    const { env } = yield* CloudflareEnv
+    return env[bindingName] as KVNamespace
+  })
+
   const ops: KVOperations = {
     get: (key: string) =>
-      Effect.tryPromise({
-        try: () => kv.get(key),
-        catch: (error) =>
-          new KVError({
-            operation: "get",
-            key,
-            message: `[${bindingName}] Failed to get key "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const kv = yield* getKV
+        return yield* Effect.tryPromise({
+          try: () => kv.get(key),
+          catch: (error) =>
+            new KVError({
+              operation: "get",
+              key,
+              message: `[${bindingName}] Failed to get key "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.map(Option.fromNullable),
         Effect.withSpan("kv.get", {
@@ -162,6 +173,7 @@ const makeKVOperations = (
 
     getWithMetadata: <A, I, R>(key: string, schema: Schema.Schema<A, I, R>) =>
       Effect.gen(function* () {
+        const kv = yield* getKV
         const result = yield* Effect.tryPromise({
           try: () => kv.getWithMetadata(key),
           catch: (error) =>
@@ -200,15 +212,18 @@ const makeKVOperations = (
       ),
 
     set: (key, value, options) =>
-      Effect.tryPromise({
-        try: () => kv.put(key, value, options),
-        catch: (error) =>
-          new KVError({
-            operation: "set",
-            key,
-            message: `[${bindingName}] Failed to set key "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const kv = yield* getKV
+        yield* Effect.tryPromise({
+          try: () => kv.put(key, value, options),
+          catch: (error) =>
+            new KVError({
+              operation: "set",
+              key,
+              message: `[${bindingName}] Failed to set key "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.withSpan("kv.set", {
           attributes: { "kv.binding": bindingName, "kv.key": key },
@@ -230,15 +245,18 @@ const makeKVOperations = (
       ),
 
     delete: (key) =>
-      Effect.tryPromise({
-        try: () => kv.delete(key),
-        catch: (error) =>
-          new KVError({
-            operation: "delete",
-            key,
-            message: `[${bindingName}] Failed to delete key "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const kv = yield* getKV
+        yield* Effect.tryPromise({
+          try: () => kv.delete(key),
+          catch: (error) =>
+            new KVError({
+              operation: "delete",
+              key,
+              message: `[${bindingName}] Failed to delete key "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.withSpan("kv.delete", {
           attributes: { "kv.binding": bindingName, "kv.key": key },
@@ -246,19 +264,22 @@ const makeKVOperations = (
       ),
 
     list: (options) =>
-      Effect.tryPromise({
-        try: () => kv.list(options),
-        catch: (error) =>
-          new KVError({
-            operation: "list",
-            message: `[${bindingName}] Failed to list keys`,
-            cause: error,
-          }),
-      }).pipe(
-        Effect.map((result) => ({
+      Effect.gen(function* () {
+        const kv = yield* getKV
+        const result = yield* Effect.tryPromise({
+          try: () => kv.list(options),
+          catch: (error) =>
+            new KVError({
+              operation: "list",
+              message: `[${bindingName}] Failed to list keys`,
+              cause: error,
+            }),
+        })
+        return {
           keys: result.keys,
           cursor: result.list_complete ? undefined : result.cursor,
-        })),
+        }
+      }).pipe(
         Effect.withSpan("kv.list", {
           attributes: { "kv.binding": bindingName },
         })
@@ -270,30 +291,13 @@ const makeKVOperations = (
 
 /**
  * Live KV Service Implementation
+ *
+ * IMPORTANT: This layer is built ONCE at module level.
+ * CloudflareEnv is accessed at METHOD CALL time, not construction time.
  */
-export const KVLive = Layer.effect(
-  KV,
-  Effect.gen(function* () {
-    const { env } = yield* CloudflareBindings
-
-    // Cache operations per binding to avoid recreating
-    const operationsCache = new Map<KVBindingName, KVOperations>()
-
-    const service: KVService = {
-      from: (binding: KVBindingName) => {
-        const cached = operationsCache.get(binding)
-        if (cached) return cached
-
-        const namespace = env[binding] as KVNamespace
-        const ops = makeKVOperations(namespace, binding)
-        operationsCache.set(binding, ops)
-        return ops
-      },
-    }
-
-    return service
-  })
-)
+export const KVLive = Layer.succeed(KV, {
+  from: (binding: KVBindingName) => makeKVOperations(binding),
+})
 
 // ---------------------------------------------------------------------------
 // Legacy Exports (for backwards compatibility during migration)

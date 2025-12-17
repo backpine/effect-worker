@@ -4,7 +4,7 @@ import { Effect, Layer, ManagedRuntime } from "effect"
 import { healthRoutes } from "@/routes/health"
 import { Config } from "@/services"
 import { ConfigError } from "@/errors"
-import { TestLayer } from "../../fixtures/mock-services"
+import { TestLayer, MockCloudflareEnv, MockCloudflareCtx } from "../../fixtures/mock-services"
 
 /**
  * HTTP Route Testing Pattern
@@ -95,31 +95,35 @@ describe("Health Routes", () => {
 
     it("should return default value when config key not found", async () => {
       // Arrange: Create a custom config layer that doesn't have ENVIRONMENT
-      const CustomConfigLayer = Layer.succeed(Config, {
-        get: () =>
-          Effect.fail(
-            new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
-          ),
-        getSecret: () =>
-          Effect.fail(
-            new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
-          ),
-        getNumber: () =>
-          Effect.fail(
-            new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
-          ),
-        getBoolean: () =>
-          Effect.fail(
-            new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
-          ),
-        getJson: () =>
-          Effect.fail(
-            new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
-          ),
-        getOrElse: (_key: string, defaultValue: string) =>
-          Effect.succeed(defaultValue),
-        getAll: () => Effect.succeed({}),
-      })
+      const CustomConfigLayer = Layer.mergeAll(
+        MockCloudflareEnv,
+        MockCloudflareCtx,
+        Layer.succeed(Config, {
+          get: () =>
+            Effect.fail(
+              new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
+            ),
+          getSecret: () =>
+            Effect.fail(
+              new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
+            ),
+          getNumber: () =>
+            Effect.fail(
+              new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
+            ),
+          getBoolean: () =>
+            Effect.fail(
+              new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
+            ),
+          getJson: () =>
+            Effect.fail(
+              new ConfigError({ key: "ENVIRONMENT", message: "Not found" })
+            ),
+          getOrElse: (_key: string, defaultValue: string) =>
+            Effect.succeed(defaultValue),
+          getAll: () => Effect.succeed({}),
+        })
+      )
 
       const { handler, dispose } = await createTestHandler(
         healthRoutes,

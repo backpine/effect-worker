@@ -3,6 +3,8 @@ import {
   Config,
   Storage,
   KVMemory,
+  CloudflareEnv,
+  CloudflareCtx,
 } from "@/services"
 import type {
   ConfigService,
@@ -11,6 +13,31 @@ import type {
   R2BindingName,
 } from "@/services"
 import { ConfigError, StorageError } from "@/errors"
+
+/**
+ * Mock Cloudflare Environment for tests
+ *
+ * Provides a minimal Env object for testing.
+ * Tests can override this with custom values if needed.
+ */
+export const MockCloudflareEnv = Layer.succeed(CloudflareEnv, {
+  env: {
+    ENVIRONMENT: "test",
+    LOG_LEVEL: "debug",
+    API_KEY: "test-api-key",
+    DATABASE_URL: "postgres://test:test@localhost:5432/test",
+  } as unknown as Env,
+})
+
+/**
+ * Mock Execution Context for tests
+ */
+export const MockCloudflareCtx = Layer.succeed(CloudflareCtx, {
+  ctx: {
+    waitUntil: () => {},
+    passThroughOnException: () => {},
+  } as unknown as ExecutionContext,
+})
 
 /**
  * Mock Config for tests
@@ -346,8 +373,13 @@ export const MockStorage = Layer.sync(Storage, () => {
 
 /**
  * Complete test layer
+ *
+ * Includes mock Cloudflare context so services that access
+ * CloudflareEnv at call time will work in tests.
  */
 export const TestLayer = Layer.mergeAll(
+  MockCloudflareEnv,
+  MockCloudflareCtx,
   MockConfig,
   MockKV,
   MockStorage,

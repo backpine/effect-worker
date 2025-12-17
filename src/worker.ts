@@ -1,14 +1,35 @@
-import * as HttpApp from "@effect/platform/HttpApp";
-import { Layer, ManagedRuntime } from "effect";
-import { appRouter } from "./router";
-import { AppCoreLive } from "./app";
-import { CloudflareBindings } from "@/services";
+import { Context, Effect, ManagedRuntime } from "effect";
+import { handleRequest } from "./handler";
+import { AppLayer } from "./app";
+import { CloudflareEnv, CloudflareCtx } from "./services";
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Module-Level Runtime (built ONCE per isolate)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * Singleton managed runtime.
+ *
+ * Built once when the worker isolate initializes.
+ * Contains all application services (Database, Config, KV, Storage).
+ *
+ * Database connection is established at this point using module-level env.
+ * Other services are built but will access CloudflareEnv at method call time.
+ */
+const runtime = ManagedRuntime.make(AppLayer);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Worker Export
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /**
  * Cloudflare Worker Entry Point
  *
- * Uses @effect/platform HttpRouter for routing with Effect for business logic.
- * Routes are defined in src/routes/
+ * Following the effect-cloudflare pattern:
+ * - Runtime is built ONCE at module level (contains Database, Config, KV, Storage)
+ * - Request-scoped data (env, ctx) is provided as Context per-request
+ * - Providing Context is O(1) - just adds to the context map
+ * - No layer rebuilding per request!
  */
 export default {
   async fetch(
@@ -16,21 +37,16 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
-    // Create the application layer with Cloudflare bindings
-    const bindingsLayer = CloudflareBindings.layer(env, ctx);
-    const appLayer = AppCoreLive.pipe(Layer.provide(bindingsLayer));
+    // Create Context (NOT Layer!) for request-scoped data
+    // This is O(1) - just adds service instances to the context map
+    const requestContext = Context.make(CloudflareEnv, { env }).pipe(
+      Context.add(CloudflareCtx, { ctx }),
+    );
 
-    // Create managed runtime for this request
-    const managedRuntime = ManagedRuntime.make(appLayer);
+    const effect = handleRequest(request).pipe(
+      Effect.provide(requestContext),
+    );
 
-    try {
-      // Get the runtime and create handler
-      const rt = await managedRuntime.runtime();
-      const handler = HttpApp.toWebHandlerRuntime(rt)(appRouter);
-      return await handler(request);
-    } finally {
-      // Cleanup runtime after request
-      ctx.waitUntil(managedRuntime.dispose());
-    }
+    return runtime.runPromise(effect);
   },
 };

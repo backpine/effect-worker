@@ -1,22 +1,25 @@
 import { Context, Effect, Layer, Option } from "effect"
 import { Schema } from "effect"
-import { CloudflareBindings } from "./bindings"
+import { CloudflareEnv } from "./cloudflare"
 import { StorageError } from "@/errors"
 import type { R2BindingName } from "./types"
 
 /**
  * Operations available on an R2 bucket
+ *
+ * IMPORTANT: Methods require CloudflareEnv to be provided in the context.
+ * This is provided per-request via Context.make(CloudflareEnv, { env }).
  */
 export interface StorageOperations {
   /**
    * Get an object by key
    */
-  readonly get: (key: string) => Effect.Effect<Option.Option<R2ObjectBody>, StorageError>
+  readonly get: (key: string) => Effect.Effect<Option.Option<R2ObjectBody>, StorageError, CloudflareEnv>
 
   /**
    * Get object metadata without downloading the body
    */
-  readonly head: (key: string) => Effect.Effect<Option.Option<R2Object>, StorageError>
+  readonly head: (key: string) => Effect.Effect<Option.Option<R2Object>, StorageError, CloudflareEnv>
 
   /**
    * Put an object
@@ -25,35 +28,36 @@ export interface StorageOperations {
     key: string,
     value: ReadableStream | ArrayBuffer | ArrayBufferView | string | Blob,
     options?: R2PutOptions
-  ) => Effect.Effect<R2Object, StorageError>
+  ) => Effect.Effect<R2Object, StorageError, CloudflareEnv>
 
   /**
    * Delete an object
    */
-  readonly delete: (key: string) => Effect.Effect<void, StorageError>
+  readonly delete: (key: string) => Effect.Effect<void, StorageError, CloudflareEnv>
 
   /**
    * Delete multiple objects
    */
-  readonly deleteMany: (keys: string[]) => Effect.Effect<void, StorageError>
+  readonly deleteMany: (keys: string[]) => Effect.Effect<void, StorageError, CloudflareEnv>
 
   /**
    * List objects
    */
   readonly list: (options?: R2ListOptions) => Effect.Effect<
     { objects: R2Object[]; truncated: boolean; cursor?: string },
-    StorageError
+    StorageError,
+    CloudflareEnv
   >
 
   /**
    * Check if an object exists
    */
-  readonly exists: (key: string) => Effect.Effect<boolean, StorageError>
+  readonly exists: (key: string) => Effect.Effect<boolean, StorageError, CloudflareEnv>
 
   /**
    * Get object as text
    */
-  readonly getText: (key: string) => Effect.Effect<Option.Option<string>, StorageError>
+  readonly getText: (key: string) => Effect.Effect<Option.Option<string>, StorageError, CloudflareEnv>
 
   /**
    * Get object as JSON with schema validation
@@ -61,7 +65,7 @@ export interface StorageOperations {
   readonly getJson: <A, I, R>(
     key: string,
     schema: Schema.Schema<A, I, R>
-  ) => Effect.Effect<Option.Option<A>, StorageError, R>
+  ) => Effect.Effect<Option.Option<A>, StorageError, CloudflareEnv | R>
 
   /**
    * Put JSON object
@@ -70,7 +74,7 @@ export interface StorageOperations {
     key: string,
     value: A,
     options?: Omit<R2PutOptions, "httpMetadata">
-  ) => Effect.Effect<R2Object, StorageError>
+  ) => Effect.Effect<R2Object, StorageError, CloudflareEnv>
 }
 
 /**
@@ -101,23 +105,31 @@ export interface StorageService {
 export class Storage extends Context.Tag("Storage")<Storage, StorageService>() {}
 
 /**
- * Create Storage operations for a specific bucket
+ * Create Storage operations for a specific bucket.
+ *
+ * IMPORTANT: Each method accesses CloudflareEnv at CALL time, not construction time.
+ * This allows the layer to be built once while still accessing request-specific env.
  */
-const makeStorageOperations = (
-  r2: R2Bucket,
-  bindingName: string
-): StorageOperations => {
+const makeStorageOperations = (bindingName: R2BindingName): StorageOperations => {
+  const getR2 = Effect.gen(function* () {
+    const { env } = yield* CloudflareEnv
+    return env[bindingName] as R2Bucket
+  })
+
   const ops: StorageOperations = {
     get: (key: string) =>
-      Effect.tryPromise({
-        try: () => r2.get(key),
-        catch: (error) =>
-          new StorageError({
-            operation: "get",
-            key,
-            message: `[${bindingName}] Failed to get object "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const r2 = yield* getR2
+        return yield* Effect.tryPromise({
+          try: () => r2.get(key),
+          catch: (error) =>
+            new StorageError({
+              operation: "get",
+              key,
+              message: `[${bindingName}] Failed to get object "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.map(Option.fromNullable),
         Effect.withSpan("storage.get", {
@@ -126,15 +138,18 @@ const makeStorageOperations = (
       ),
 
     head: (key: string) =>
-      Effect.tryPromise({
-        try: () => r2.head(key),
-        catch: (error) =>
-          new StorageError({
-            operation: "head",
-            key,
-            message: `[${bindingName}] Failed to get metadata "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const r2 = yield* getR2
+        return yield* Effect.tryPromise({
+          try: () => r2.head(key),
+          catch: (error) =>
+            new StorageError({
+              operation: "head",
+              key,
+              message: `[${bindingName}] Failed to get metadata "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.map(Option.fromNullable),
         Effect.withSpan("storage.head", {
@@ -143,15 +158,18 @@ const makeStorageOperations = (
       ),
 
     put: (key, value, options) =>
-      Effect.tryPromise({
-        try: () => r2.put(key, value, options),
-        catch: (error) =>
-          new StorageError({
-            operation: "put",
-            key,
-            message: `[${bindingName}] Failed to put object "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const r2 = yield* getR2
+        return yield* Effect.tryPromise({
+          try: () => r2.put(key, value, options),
+          catch: (error) =>
+            new StorageError({
+              operation: "put",
+              key,
+              message: `[${bindingName}] Failed to put object "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.withSpan("storage.put", {
           attributes: { "storage.binding": bindingName, "storage.key": key },
@@ -159,15 +177,18 @@ const makeStorageOperations = (
       ),
 
     delete: (key) =>
-      Effect.tryPromise({
-        try: () => r2.delete(key),
-        catch: (error) =>
-          new StorageError({
-            operation: "delete",
-            key,
-            message: `[${bindingName}] Failed to delete object "${key}"`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const r2 = yield* getR2
+        yield* Effect.tryPromise({
+          try: () => r2.delete(key),
+          catch: (error) =>
+            new StorageError({
+              operation: "delete",
+              key,
+              message: `[${bindingName}] Failed to delete object "${key}"`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.withSpan("storage.delete", {
           attributes: { "storage.binding": bindingName, "storage.key": key },
@@ -175,14 +196,17 @@ const makeStorageOperations = (
       ),
 
     deleteMany: (keys) =>
-      Effect.tryPromise({
-        try: () => r2.delete(keys),
-        catch: (error) =>
-          new StorageError({
-            operation: "deleteMany",
-            message: `[${bindingName}] Failed to delete ${keys.length} objects`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const r2 = yield* getR2
+        yield* Effect.tryPromise({
+          try: () => r2.delete(keys),
+          catch: (error) =>
+            new StorageError({
+              operation: "deleteMany",
+              message: `[${bindingName}] Failed to delete ${keys.length} objects`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.withSpan("storage.deleteMany", {
           attributes: { "storage.binding": bindingName, "storage.count": keys.length },
@@ -190,14 +214,17 @@ const makeStorageOperations = (
       ),
 
     list: (options) =>
-      Effect.tryPromise({
-        try: () => r2.list(options),
-        catch: (error) =>
-          new StorageError({
-            operation: "list",
-            message: `[${bindingName}] Failed to list objects`,
-            cause: error,
-          }),
+      Effect.gen(function* () {
+        const r2 = yield* getR2
+        return yield* Effect.tryPromise({
+          try: () => r2.list(options),
+          catch: (error) =>
+            new StorageError({
+              operation: "list",
+              message: `[${bindingName}] Failed to list objects`,
+              cause: error,
+            }),
+        })
       }).pipe(
         Effect.withSpan("storage.list", {
           attributes: { "storage.binding": bindingName },
@@ -288,30 +315,13 @@ const makeStorageOperations = (
 
 /**
  * Live Storage Service Implementation
+ *
+ * IMPORTANT: This layer is built ONCE at module level.
+ * CloudflareEnv is accessed at METHOD CALL time, not construction time.
  */
-export const StorageLive = Layer.effect(
-  Storage,
-  Effect.gen(function* () {
-    const { env } = yield* CloudflareBindings
-
-    // Cache operations per binding to avoid recreating
-    const operationsCache = new Map<R2BindingName, StorageOperations>()
-
-    const service: StorageService = {
-      from: (binding: R2BindingName) => {
-        const cached = operationsCache.get(binding)
-        if (cached) return cached
-
-        const bucket = env[binding] as R2Bucket
-        const ops = makeStorageOperations(bucket, binding)
-        operationsCache.set(binding, ops)
-        return ops
-      },
-    }
-
-    return service
-  })
-)
+export const StorageLive = Layer.succeed(Storage, {
+  from: (binding: R2BindingName) => makeStorageOperations(binding),
+})
 
 // ---------------------------------------------------------------------------
 // Legacy Exports (for backwards compatibility during migration)
