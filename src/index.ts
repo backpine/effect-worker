@@ -21,58 +21,28 @@
  *
  * ```
  * fetch(request, env, ctx)
- *   └─> withRequestScope(env, ctx)
- *         ├─> withDatabase(env.DATABASE_URL)
- *         ├─> withEnv(env)
- *         └─> withCtx(ctx)
- *               └─> handleRequest(request)
- *                     └─> Handler accesses services via:
- *                           - getDrizzle (database)
- *                           - getEnv (Cloudflare bindings)
- *                           - getCtx (ExecutionContext)
+ *   └─> withCloudflareBindings(env, ctx)
+ *         └─> handleRequest(request)
+ *               └─> Middleware chain:
+ *                     ├─> CloudflareBindingsMiddleware → provides env/ctx
+ *                     └─> DatabaseMiddleware → provides drizzle
+ *                           └─> Handler accesses services via:
+ *                                 - yield* CloudflareBindings
+ *                                 - yield* DatabaseService
  * ```
  *
- * ## Why FiberRef for Request-Scoped Data?
+ * ## Middleware-Based Request-Scoped Services
  *
- * We use FiberRef instead of Effect's Layer/Context.Tag pattern because:
+ * Services are provided via HttpApiMiddleware:
+ * - CloudflareBindingsMiddleware: Provides env/ctx from FiberRef
+ * - DatabaseMiddleware: Creates per-request database connection
  *
- * 1. **Layer memoization**: ManagedRuntime builds layers ONCE at startup.
- *    Cloudflare bindings aren't available at startup, only at request time.
- *
- * 2. **Per-request isolation**: FiberRef + Effect.locally ensures each request
- *    has its own isolated values, even when running on the same runtime.
- *
- * 3. **Type safety without placeholders**: Using FiberRef avoids the need for
- *    placeholder layers that would require "as any" casts.
+ * Handlers access services using standard Effect pattern: `yield* ServiceTag`
  *
  * @module
  */
-import { Effect } from "effect";
-import { runtime, handleRequest, openApiSpec } from "@/runtime";
-import { withDatabase, withEnv, withCtx } from "@/services";
-
-/**
- * Wrap an effect with all request-scoped resources.
- *
- * Provides per-request:
- * - Database connection (opened per request, closed when scope ends)
- * - Cloudflare env (via FiberRef)
- * - Cloudflare execution context (via FiberRef)
- */
-/**
- * Local development database URL (used when env.DATABASE_URL is not set).
- */
-const LOCAL_DATABASE_URL =
-  "postgres://postgres:postgres@localhost:5432/effect_worker";
-
-const withRequestScope =
-  (env: Env, ctx: ExecutionContext) =>
-  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    effect.pipe(
-      withDatabase(env.DATABASE_URL ?? LOCAL_DATABASE_URL),
-      withEnv(env),
-      withCtx(ctx),
-    );
+import { runtime, handleRequest, openApiSpec } from "@/runtime"
+import { withCloudflareBindings } from "@/services/cloudflare.middleware"
 
 /**
  * Cloudflare Worker fetch handler.
@@ -81,15 +51,19 @@ const withRequestScope =
  */
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(request.url);
+    const url = new URL(request.url)
 
     // Serve OpenAPI spec at /api/openapi.json
     if (url.pathname === "/api/openapi.json") {
-      return Response.json(openApiSpec);
+      return Response.json(openApiSpec)
     }
 
-    // Handle all other requests through the Effect runtime
-    const effect = handleRequest(request).pipe(withRequestScope(env, ctx));
-    return runtime.runPromise(effect);
+    // Handle request with Cloudflare bindings available via FiberRef
+    // Middleware handles database connection per-request
+    const effect = handleRequest(request).pipe(
+      withCloudflareBindings(env, ctx),
+    )
+
+    return runtime.runPromise(effect)
   },
-};
+}

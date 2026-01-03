@@ -14,50 +14,62 @@
  *
  * ## What About Request-Scoped Services?
  *
- * Request-scoped services (database, Cloudflare env) are NOT part of the
- * ManagedRuntime layer. Instead, they're provided via FiberRef + Effect.locally
- * in the request handler (see src/index.ts).
+ * Request-scoped services (database, Cloudflare env) use HttpApiMiddleware.
+ * The middleware IMPLEMENTATIONS are provided to the runtime, but the actual
+ * middleware EFFECTS run per-request.
  *
  * This separation ensures:
  * - Static services: Built once, reused (efficient)
- * - Request-scoped services: Created per-request (isolated)
+ * - Request-scoped services: Created per-request via middleware (isolated)
  *
  * ## Layer Composition
  *
  * ```
  * ApiLayer (built once at startup)
  * ├── HttpApiBuilder.api(WorkerApi)
- * │   └── HttpGroupsLive (handler implementations)
+ * │   └── HttpGroupsLive (handler + middleware implementations)
  * ├── HttpApiBuilder.Router.Live
  * ├── HttpApiBuilder.Middleware.layer
  * └── HttpServer.layerContext
  *
- * Request-scoped (provided per-request via FiberRef)
- * ├── withDatabase() → getDrizzle
- * ├── withEnv() → getEnv
- * └── withCtx() → getCtx
+ * Request-scoped (via HttpApiMiddleware, effects run per-request)
+ * ├── CloudflareBindingsMiddleware → provides CloudflareBindings
+ * └── DatabaseMiddleware → provides DatabaseService
  * ```
  *
  * @module
  */
-import { Effect, Layer, ManagedRuntime } from "effect"
-import { HttpApiBuilder, HttpServer, OpenApi } from "@effect/platform"
-import * as ServerRequest from "@effect/platform/HttpServerRequest"
-import * as ServerResponse from "@effect/platform/HttpServerResponse"
-import { WorkerApi, HttpGroupsLive } from "@/http"
+import { Effect, Layer, ManagedRuntime } from "effect";
+import { HttpApiBuilder, HttpServer, OpenApi } from "@effect/platform";
+import * as ServerRequest from "@effect/platform/HttpServerRequest";
+import * as ServerResponse from "@effect/platform/HttpServerResponse";
+import { WorkerApi, HttpGroupsLive } from "@/http";
+import { CloudflareBindingsMiddlewareLive } from "@/services/cloudflare.middleware";
+import { DatabaseMiddlewareLive } from "@/services/database.middleware";
+
+/**
+ * Combined middleware layer.
+ *
+ * Middleware implementations are provided at the runtime level.
+ */
+const MiddlewareLive = Layer.mergeAll(
+  CloudflareBindingsMiddlewareLive,
+  DatabaseMiddlewareLive,
+);
 
 /**
  * API Layer combining static services.
  *
  * These layers are memoized by ManagedRuntime - built once at startup.
- * Request-scoped services are provided separately via FiberRef.
+ * Middleware layers are provided here so their implementations are available,
+ * but the middleware effects run per-request.
  */
 const ApiLayer = Layer.mergeAll(
   HttpApiBuilder.api(WorkerApi).pipe(Layer.provide(HttpGroupsLive)),
   HttpApiBuilder.Router.Live,
   HttpApiBuilder.Middleware.layer,
   HttpServer.layerContext,
-)
+).pipe(Layer.provide(MiddlewareLive));
 
 /**
  * Shared runtime instance.
@@ -65,7 +77,7 @@ const ApiLayer = Layer.mergeAll(
  * Built once at module initialization. Layers are memoized, so subsequent
  * calls to runPromise reuse the same service instances.
  */
-export const runtime = ManagedRuntime.make(ApiLayer)
+export const runtime = ManagedRuntime.make(ApiLayer);
 
 /**
  * Handle an incoming HTTP request.
@@ -86,9 +98,9 @@ export const runtime = ManagedRuntime.make(ApiLayer)
  */
 export const handleRequest = (request: Request) =>
   Effect.gen(function* () {
-    const app = yield* HttpApiBuilder.httpApp
-    const serverRequest = ServerRequest.fromWeb(request)
-    const url = new URL(request.url)
+    const app = yield* HttpApiBuilder.httpApp;
+    const serverRequest = ServerRequest.fromWeb(request);
+    const url = new URL(request.url);
 
     const response = yield* app.pipe(
       Effect.provideService(ServerRequest.HttpServerRequest, serverRequest),
@@ -103,10 +115,10 @@ export const handleRequest = (request: Request) =>
           { status: 404 },
         ),
       ),
-    )
+    );
 
-    return ServerResponse.toWeb(response)
-  })
+    return ServerResponse.toWeb(response);
+  });
 
 /**
  * OpenAPI specification for the API.
@@ -114,4 +126,4 @@ export const handleRequest = (request: Request) =>
  * Generated from the WorkerApi definition. Serve this at /api/openapi.json
  * for API documentation and client generation.
  */
-export const openApiSpec = OpenApi.fromApi(WorkerApi)
+export const openApiSpec = OpenApi.fromApi(WorkerApi);

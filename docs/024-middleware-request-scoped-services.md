@@ -188,6 +188,59 @@ const { drizzle } = yield* DatabaseService
 // Error: Service 'DatabaseService' is not available in the current context
 ```
 
+## Important Implementation Notes
+
+### Middleware Effect Requirements
+
+Middleware effects can ONLY have `HttpRouter.Provided` as their context requirements. This means:
+
+1. **Middleware cannot depend on other middleware services** via `yield* OtherService`
+2. **Middleware CAN read from FiberRef** since FiberRef reads don't create service dependencies
+3. **Both CloudflareBindings and Database middleware read from the same FiberRefs** set by `withCloudflareBindings()`
+
+```typescript
+// WRONG: Creates a dependency that middleware can't satisfy
+export const DatabaseMiddlewareLive = Layer.effect(
+  DatabaseMiddleware,
+  Effect.gen(function* () {
+    return Effect.gen(function* () {
+      const { env } = yield* CloudflareBindings  // ❌ Creates dependency
+      // ...
+    })
+  }),
+)
+
+// CORRECT: Read directly from FiberRef
+export const DatabaseMiddlewareLive = Layer.effect(
+  DatabaseMiddleware,
+  Effect.gen(function* () {
+    return Effect.gen(function* () {
+      const env = yield* FiberRef.get(currentEnv)  // ✓ No dependency
+      // ...
+    })
+  }),
+)
+```
+
+### Middleware Layer Provision
+
+Middleware layers must be provided at the **runtime level**, not just at the groups level:
+
+```typescript
+// runtime.ts
+const MiddlewareLive = Layer.mergeAll(
+  CloudflareBindingsMiddlewareLive,
+  DatabaseMiddlewareLive,
+)
+
+const ApiLayer = Layer.mergeAll(
+  HttpApiBuilder.api(WorkerApi).pipe(Layer.provide(HttpGroupsLive)),
+  HttpApiBuilder.Router.Live,
+  HttpApiBuilder.Middleware.layer,
+  HttpServer.layerContext,
+).pipe(Layer.provide(MiddlewareLive))  // ← Provide middleware here
+```
+
 ## Implementation for effect-worker
 
 ### File Structure
@@ -204,6 +257,7 @@ src/
 │   │   ├── users.definition.ts     # Add .middleware(DatabaseMiddleware)
 │   │   └── users.handlers.ts       # Use yield* DatabaseService
 │   └── index.ts
+├── runtime.ts                      # Provides middleware layers
 └── index.ts                        # Worker entry point (simplified)
 ```
 
