@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "effect-worker",
-  "main": "src/worker.ts",
+  "main": "src/index.ts",
   "compatibility_date": "2024-11-27",
   "compatibility_flags": ["nodejs_compat"],
 
@@ -32,6 +32,12 @@
     {
       "binding": "MY_BUCKET",
       "bucket_name": "effect-worker-storage",
+    },
+  ],
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "d0452848282e4955b8d472667b2ac963",
     },
   ],
 }

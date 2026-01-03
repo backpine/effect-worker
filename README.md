@@ -1,147 +1,263 @@
 # Effect Worker
 
-A library that bridges Effect-TS with Cloudflare Workers runtime. It provides effectful, type-safe, and composable patterns for building serverless applications.
+An Effect-TS application running on Cloudflare Workers with request-scoped database connections.
 
-## Implementation Status
+> **Note**: This is an exploration of patterns for Effect + Cloudflare Workers. The FiberRef approach works, but there may be better patterns. Feedback welcome.
 
-This implementation is based on the design document at `docs/002-implementation-guide.md` with the following modifications:
+## The Problem
 
-- **Database/Drizzle excluded**: No D1 database, Drizzle ORM, or database-related code
-- **Simplified naming**: Service implementations use `Live` suffix instead of platform-specific names
-  - `KVStoreLive` (instead of `KVStoreCloudflare`)
-  - `ObjectStorageLive` (instead of `ObjectStorageR2`)
-  - Exception: `CloudflareBindings` keeps its name as it's specifically for Cloudflare env
+Cloudflare Workers can't share TCP connections between requests. Each request needs its own database connection that gets created, used, and cleaned up within that request's lifetime.
+
+```
+Traditional Node.js Server:
+┌─────────────────────────────────────────────────────┐
+│ Server Process                                      │
+│                                                     │
+│  ┌─────────────────────────────────────────────┐   │
+│  │ Connection Pool (shared across requests)     │   │
+│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐        │   │
+│  │  │conn│ │conn│ │conn│ │conn│ │conn│        │   │
+│  │  └────┘ └────┘ └────┘ └────┘ └────┘        │   │
+│  └─────────────────────────────────────────────┘   │
+│        ↑           ↑           ↑                   │
+│   Request 1   Request 2   Request 3                │
+└─────────────────────────────────────────────────────┘
+
+Cloudflare Worker:
+┌─────────────────────────────────────────────────────┐
+│ Worker Isolate                                      │
+│                                                     │
+│  Request 1: [open conn] → [query] → [close conn]   │
+│  Request 2: [open conn] → [query] → [close conn]   │
+│  Request 3: [open conn] → [query] → [close conn]   │
+│                                                     │
+│  No shared state. No connection pool.              │
+└─────────────────────────────────────────────────────┘
+```
+
+## Why Effect Layers Don't Work Here
+
+In Effect, you typically define services with `Context.Tag` and compose them with `Layer`:
+
+```typescript
+// This is the "normal" Effect pattern
+class Database extends Context.Tag("Database")<Database, DrizzleInstance>() {
+  static Live = Layer.effect(this, makeDrizzleClient())
+}
+
+// Use in handlers
+const getUsers = Effect.gen(function* () {
+  const db = yield* Database
+  return yield* db.select().from(users)
+})
+```
+
+The problem: **Layers are memoized**.
+
+When you create a `ManagedRuntime`, it builds all layers once at startup:
+
+```typescript
+const runtime = ManagedRuntime.make(
+  Layer.mergeAll(
+    Database.Live,        // Built ONCE at startup
+    HttpRouter.Live,      // Built ONCE at startup
+    HttpMiddleware.Live,  // Built ONCE at startup
+  )
+)
+```
+
+For Cloudflare Workers, `env` is available at startup, so we *could* create a database layer. But that layer would open a TCP connection once and try to reuse it across requests. **This fails immediately on the second request:**
+
+```
+ManagedRuntime with Database Layer:
+┌─────────────────────────────────────────────────────┐
+│ Module Initialization (once)                        │
+│                                                     │
+│   ManagedRuntime.make(layers)                       │
+│        ↓                                            │
+│   Build HttpRouter.Live ✓                           │
+│   Build Database.Live ✓                             │
+│        ↓                                            │
+│   Opens TCP connection to Postgres                  │
+│        ↓                                            │
+│   Connection stored in layer (memoized)             │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────┐
+│ Request 1: Uses memoized connection ✓               │
+│ Request 2: CRASH ✗                                  │
+│ Request 3: Fresh isolate, works ✓                   │
+│ Request 4: CRASH ✗                                  │
+│ ...every other request fails                        │
+└─────────────────────────────────────────────────────┘
+```
+
+The exact error from Cloudflare:
+
+```
+Error: Cannot perform I/O on behalf of a different request.
+I/O objects (such as streams, request/response bodies, and others)
+created in the context of one request handler cannot be accessed
+from a different request's handler. This is a limitation of
+Cloudflare Workers which allows us to improve overall performance.
+```
+
+This isn't about connections going stale - Cloudflare **actively prevents** I/O objects from being shared between requests. The TCP socket opened during Request 1 cannot be used by Request 2. Period.
+
+## Our Solution: FiberRef
+
+FiberRef provides fiber-local storage. Think of it like `AsyncLocalStorage` in Node.js.
+
+```typescript
+// Create a FiberRef with null default
+export const currentDrizzle = FiberRef.unsafeMake<DrizzleInstance | null>(null)
+
+// Accessor - dies if null (programming error)
+export const getDrizzle = Effect.gen(function* () {
+  const drizzle = yield* FiberRef.get(currentDrizzle)
+  if (drizzle === null) {
+    return yield* Effect.die("Database not available")
+  }
+  return drizzle
+})
+
+// Wrapper - sets value for scope of effect
+export const withDatabase = (connectionString: string) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const pgClient = yield* PgClient.make({ url: connectionString })
+        const drizzle = yield* PgDrizzle.make()
+        return yield* Effect.locally(currentDrizzle, drizzle)(effect)
+      })
+    )
+```
+
+## Request Flow
+
+```
+fetch(request, env, ctx)
+│
+├─→ withDatabase(env.DATABASE_URL)
+│     └─→ Opens TCP connection
+│         └─→ Sets FiberRef
+│
+├─→ withEnv(env)
+│     └─→ Sets FiberRef
+│
+├─→ withCtx(ctx)
+│     └─→ Sets FiberRef
+│
+└─→ handleRequest(request)
+      │
+      ├─→ Handler calls: yield* getDrizzle
+      │     └─→ Reads from FiberRef
+      │
+      └─→ Response returned
+            └─→ Scope ends, TCP connection closed
+```
+
+## Usage in Handlers
+
+```typescript
+// src/http/groups/users.handlers.ts
+.handle("list", () =>
+  Effect.gen(function* () {
+    const db = yield* getDrizzle  // Gets request-scoped connection
+    const dbUsers = yield* db.select().from(users)
+    return { users: dbUsers, total: dbUsers.length }
+  })
+)
+```
+
+## Entry Point
+
+```typescript
+// src/index.ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const effect = handleRequest(request).pipe(
+      withDatabase(env.DATABASE_URL ?? LOCAL_DATABASE_URL),
+      withEnv(env),
+      withCtx(ctx),
+    )
+    return runtime.runPromise(effect)
+  }
+}
+```
+
+## What Gets Memoized vs Per-Request
+
+```
+┌─────────────────────────────────────────────────────┐
+│ ManagedRuntime (built once, reused)                 │
+│                                                     │
+│   HttpApiBuilder.api(WorkerApi)  ← Router config    │
+│   HttpApiBuilder.Router.Live     ← Router instance  │
+│   HttpApiBuilder.Middleware.layer                   │
+│   HttpServer.layerContext                           │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+                      ↓
+              runtime.runPromise(effect)
+                      ↓
+┌─────────────────────────────────────────────────────┐
+│ Per-Request (via FiberRef)                          │
+│                                                     │
+│   withDatabase() → getDrizzle                       │
+│   withEnv()      → getEnv                           │
+│   withCtx()      → getCtx                           │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+## Open Questions
+
+1. **Is FiberRef the right pattern?** It works, but feels like we're working around Effect's layer system rather than with it.
+
+2. **Layer.scoped alternative?** Could we create a per-request runtime instead of a shared one? Probably too expensive (rebuilds all layers per request).
+
+3. **Effect.locally gotchas?** Are there edge cases where the FiberRef value doesn't propagate correctly (forked fibers, etc)?
+
+4. **Testing implications?** FiberRef requires wrapping test effects with `withDatabase()` etc. Is there a cleaner way?
+
+## Development
+
+```bash
+# Start local Postgres
+pnpm db:up
+
+# Push schema
+pnpm db:push
+
+# Seed data
+pnpm db:seed
+
+# Run dev server
+pnpm dev
+
+# Type check
+pnpm typecheck
+
+# Run tests
+pnpm test
+```
 
 ## Project Structure
 
 ```
-effect-worker/
-├── src/
-│   ├── worker.ts              # Main entry point (export default)
-│   ├── app.ts                 # Application layer composition
-│   ├── runtime.ts             # Runtime factory functions
-│   ├── services/              # Service abstractions
-│   │   ├── bindings.ts        # CloudflareBindings service
-│   │   ├── config.ts          # Config service
-│   │   ├── kv.ts              # KV Store service
-│   │   ├── storage.ts         # Object Storage (R2) service
-│   │   └── index.ts           # Re-exports all services
-│   ├── handlers/              # Handler implementations
-│   │   ├── fetch.ts           # HTTP request handler
-│   │   └── errors.ts          # Error response formatting
-│   └── errors/                # Error definitions
-│       └── index.ts           # Typed error definitions
-├── test/                      # Test files
-│   └── fixtures/              # Test fixtures
-│       └── mock-services.ts   # Mock service implementations
-├── docs/                      # Design documentation
-│   ├── 001-system-design.md   # System architecture document
-│   └── 002-implementation-guide.md # Implementation guide
-├── wrangler.toml              # Cloudflare configuration
-├── package.json               # Dependencies
-├── tsconfig.json              # TypeScript config
-└── vitest.config.ts           # Test configuration
+src/
+├── index.ts           # Worker entry point, request scoping
+├── runtime.ts         # ManagedRuntime setup
+├── services/
+│   ├── cloudflare.ts  # FiberRef for env/ctx
+│   └── database.ts    # FiberRef for Drizzle
+├── http/
+│   ├── api.ts         # HttpApi definition
+│   ├── groups/        # Endpoint definitions + handlers
+│   ├── schemas/       # Request/response schemas
+│   └── errors/        # API error types
+└── db/
+    └── schema.ts      # Drizzle schema
 ```
-
-## Files Implemented
-
-### Configuration Files
-- ✅ `package.json` - Dependencies (without drizzle)
-- ✅ `tsconfig.json` - TypeScript config for Workers + Effect
-- ✅ `wrangler.toml` - Cloudflare config (without D1 database binding)
-- ✅ `vitest.config.ts` - Test configuration
-
-### Source Files
-- ✅ `src/services/bindings.ts` - CloudflareBindings service (foundation layer)
-- ✅ `src/services/config.ts` - Config service for env vars/secrets
-- ✅ `src/services/kv.ts` - KV Store service abstraction
-- ✅ `src/services/storage.ts` - Object Storage (R2) service abstraction
-- ✅ `src/services/index.ts` - Re-exports all services
-- ✅ `src/errors/index.ts` - Error type definitions (excluding DatabaseError)
-- ✅ `src/app.ts` - Application layer composition (excluding Database)
-- ✅ `src/runtime.ts` - Runtime factory functions
-- ✅ `src/handlers/fetch.ts` - HTTP request handler
-- ✅ `src/handlers/errors.ts` - Error response formatting
-- ✅ `src/worker.ts` - Main entry point
-
-### Test Files
-- ✅ `test/fixtures/mock-services.ts` - Mock service implementations for testing
-
-## Key Features
-
-### Services Available
-
-1. **CloudflareBindings** - Foundation layer that provides access to Cloudflare's env and ExecutionContext
-2. **Config** - Type-safe configuration management with validation
-3. **KVStore** - Key-value storage with JSON support and schema validation
-4. **ObjectStorage** - R2 object storage with streaming and JSON support
-
-### Error Types
-
-All errors extend `Data.TaggedError` for type-safe error handling:
-- `ConfigError` - Configuration issues
-- `KVError` - KV operation failures
-- `StorageError` - R2 operation failures
-- `ValidationError` - Request validation failures
-- `AuthorizationError` - Authorization failures
-- `NotFoundError` - Resource not found
-
-### Example API Endpoints
-
-The implemented fetch handler includes example endpoints:
-
-- `GET /health` - Health check
-- `GET /api/kv/:key` - Get a KV value
-- `POST /api/kv/:key` - Set a KV value
-- `GET /api/storage/:key` - Get an R2 object
-- `POST /api/storage/:key` - Upload to R2
-- `GET /api/config` - Get environment info
-
-## Next Steps
-
-To use this implementation:
-
-1. Install dependencies:
-   ```bash
-   pnpm install
-   ```
-
-2. Configure your Cloudflare bindings in `wrangler.toml`
-
-3. Start local development:
-   ```bash
-   pnpm dev
-   ```
-
-4. Run tests:
-   ```bash
-   pnpm test
-   ```
-
-5. Deploy to Cloudflare:
-   ```bash
-   pnpm deploy
-   ```
-
-## Design Documents
-
-See the `docs/` directory for detailed design documentation:
-- `001-system-design.md` - System architecture overview
-- `002-implementation-guide.md` - Comprehensive implementation guide
-
-## Modifications from Design Doc
-
-1. **No Database/Drizzle**: All database-related code has been excluded
-2. **Simplified Naming**: Service implementations use cleaner names:
-   - `KVStoreLive` instead of `KVStoreCloudflare`
-   - `ObjectStorageLive` instead of `ObjectStorageR2`
-3. **Clean Dependencies**: Removed drizzle-orm and drizzle-kit from package.json
-4. **Updated Env Interface**: Removed DB binding from CloudflareBindings
-5. **Updated Handlers**: Fetch handler demonstrates KV and R2 usage without database operations
-
-## Notes
-
-- The library follows Effect-TS patterns for composition, error handling, and dependency injection
-- Runtime is cached per isolate for better performance
-- All services are swappable through Effect's layer system
-- Full type safety throughout with TypeScript strict mode

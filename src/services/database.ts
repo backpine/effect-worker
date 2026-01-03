@@ -1,125 +1,118 @@
-import { Context, Effect, Layer } from "effect";
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
-import { env } from "cloudflare:workers";
-import { DatabaseError } from "@/errors";
-
 /**
- * DrizzleClient type
+ * Database Service (Request-Scoped)
  *
- * This is the type of the Drizzle client instance.
- * When you have a schema, update this to include it:
+ * Provides access to Drizzle ORM using Effect's FiberRef pattern.
  *
- * ```typescript
- * import * as schema from "@/db/schema"
- * export type DrizzleClient = ReturnType<typeof drizzle<typeof schema>>
+ * ## Why Per-Request Database Connections?
+ *
+ * Cloudflare Workers run in a serverless environment where:
+ *
+ * 1. **No persistent connections**: Workers are stateless and may be
+ *    terminated at any time. Connection pools don't work reliably.
+ *
+ * 2. **Isolate recycling**: The same isolate may handle multiple requests,
+ *    but you cannot rely on state persisting between them.
+ *
+ * 3. **TCP connections**: Each request opens a fresh TCP connection to the
+ *    database and closes it when done. This is required for proper isolation.
+ *
+ * ## Connection Pattern
+ *
  * ```
+ * Request 1:  [open connection] → [query] → [close connection]
+ * Request 2:  [open connection] → [query] → [close connection]
+ * ```
+ *
+ * This differs from traditional Node.js apps that maintain connection
+ * pools across requests.
+ *
+ * ## Why FiberRef for Database?
+ *
+ * Same reasoning as CloudflareEnv - we need per-request instances without
+ * layer dependencies. See cloudflare.ts for the detailed explanation.
+ *
+ * @module
  */
-export type DrizzleClient = ReturnType<typeof drizzle>;
+import * as Reactivity from "@effect/experimental/Reactivity"
+import * as PgDrizzle from "@effect/sql-drizzle/Pg"
+import { PgClient } from "@effect/sql-pg"
+import * as SqlClient from "@effect/sql/SqlClient"
+import type { PgRemoteDatabase } from "drizzle-orm/pg-proxy"
+import { Effect, FiberRef, Redacted } from "effect"
 
 /**
- * Database Service
- *
- * Provides access to the Drizzle client.
- * The client is memoized once per request via Effect's layer system.
- *
- * **Usage:**
- * ```typescript
- * const db = yield* Database
- * const users = await db.select().from(usersTable)
- * ```
- *
- * **Or use the query helper:**
- * ```typescript
- * const users = yield* query((db) =>
- *   db.select().from(usersTable).where(eq(usersTable.id, id))
- * )
- * ```
+ * Type alias for the underlying Drizzle database instance.
  */
-export class Database extends Context.Tag("Database")<
-  Database,
-  DrizzleClient
->() {}
+type DrizzleInstance = PgRemoteDatabase<Record<string, never>>
 
 /**
- * Query helper
+ * FiberRef holding the current request's Drizzle instance.
+ */
+export const currentDrizzle = FiberRef.unsafeMake<DrizzleInstance | null>(null)
+
+/**
+ * Get the current Drizzle instance.
  *
- * Wraps database operations in Effects with proper error handling.
- * Automatically injects the Database client and adds tracing.
+ * Dies if called outside of withDatabase() scope.
  *
  * @example
  * ```typescript
- * const getUser = (id: string) =>
- *   query((db) =>
- *     db.select().from(users).where(eq(users.id, id)).limit(1)
- *   )
- *
- * // In your Effect.gen:
- * const users = yield* getUser("123")
+ * const drizzle = yield* getDrizzle
+ * const users = yield* drizzle.select().from(usersTable).limit(10)
  * ```
  */
-export const query = <T>(
-  fn: (db: DrizzleClient) => Promise<T>,
-): Effect.Effect<T, DatabaseError, Database> =>
-  Effect.gen(function* () {
-    const db = yield* Database;
-    return yield* Effect.tryPromise({
-      try: () => fn(db),
-      catch: (error) =>
-        new DatabaseError({
-          message: "Database query failed",
-          cause: error,
-        }),
-    });
-  }).pipe(
-    Effect.withSpan("database.query", {
-      attributes: { "db.system": "postgresql" },
-    }),
-  );
+export const getDrizzle = Effect.gen(function* () {
+  const drizzle = yield* FiberRef.get(currentDrizzle)
+  if (drizzle === null) {
+    return yield* Effect.die(
+      "Database not available. Ensure withDatabase() wraps the handler.",
+    )
+  }
+  return drizzle
+})
 
 /**
- * Live Database Layer
+ * Create a scoped database connection and make it available via FiberRef.
  *
- * Creates a database connection using the module-level env.
- * This layer is built ONCE when the ManagedRuntime initializes.
+ * ## Scope and Cleanup
  *
- * Uses `import { env } from "cloudflare:workers"` to access
- * DATABASE_URL at module level, which allows the layer to be
- * built statically without per-request env access.
+ * This uses Effect.scoped to ensure the connection is properly closed:
  *
- * @example
  * ```typescript
- * // In app.ts - layer composition
- * export const AppLayer = Layer.mergeAll(
- *   ConfigLive,
- *   KVLive,
- *   StorageLive,
- *   DatabaseLive,
+ * withDatabase(url)(myEffect)
+ * // Expands to:
+ * Effect.scoped(
+ *   PgClient.make(...) // Create connection
+ *   Effect.locally(currentDrizzle, drizzle)(myEffect)
+ *   // Connection auto-closes when scope ends
  * )
- *
- * // In worker.ts - runtime initialization
- * const runtime = ManagedRuntime.make(AppLayer)
  * ```
+ *
+ * ## Security Note
+ *
+ * The connection string should come from Cloudflare secrets (env.DATABASE_URL),
+ * not hardcoded values.
+ *
+ * @param connectionString - PostgreSQL connection URL
  */
-// export const DatabaseLive = Layer.scoped(
-//   Database,
-//   Effect.gen(function* () {
-//     console.log("Connecting to database...", Date.now());
+export const withDatabase = (connectionString: string) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Create PgClient (scoped - auto-closes when scope ends)
+        const pgClient = yield* PgClient.make({
+          url: Redacted.make(connectionString),
+        }).pipe(Effect.provide(Reactivity.layer))
 
-//     const client = postgres(env.DATABASE_URL, {
-//       max: 5,
-//       fetch_types: false,
-//     });
+        // Create Drizzle instance
+        const drizzle = yield* PgDrizzle.make({
+          casing: "snake_case",
+        }).pipe(Effect.provideService(SqlClient.SqlClient, pgClient))
 
-//     const db = drizzle(client);
+        // Run effect with Drizzle available via FiberRef
+        return yield* Effect.locally(currentDrizzle, drizzle)(effect)
+      }),
+    )
 
-//     // Register cleanup to close connections when runtime disposes
-//     yield* Effect.addFinalizer(() =>
-//       Effect.promise(async () => {
-//         await client.end({ timeout: 5 });
-//       }).pipe(Effect.catchAll(() => Effect.void)),
-//     );
-
-//     return db;
-//   }),
-// );
+// Re-export for type usage
+export { PgDrizzle }
