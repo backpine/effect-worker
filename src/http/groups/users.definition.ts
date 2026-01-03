@@ -12,16 +12,22 @@
  * - Pattern validation (email format) runs automatically at request time
  * - Validation errors automatically become HTTP 400 responses
  *
+ * ## Middleware
+ *
+ * DatabaseMiddleware is applied to this group, providing a request-scoped
+ * database connection to all handlers via `yield* DatabaseService`.
+ *
  * @module
  */
-import { HttpApiEndpoint, HttpApiGroup } from "@effect/platform";
-import { Schema as S } from "effect";
+import { HttpApiEndpoint, HttpApiGroup } from "@effect/platform"
+import { Schema as S } from "effect"
 import {
   UserSchema,
   UserIdPathSchema,
   CreateUserSchema,
-} from "@/http/schemas";
-import { UserCreationError, UserNotFoundError } from "@/http/errors";
+} from "@/http/schemas"
+import { UserCreationError, UserNotFoundError } from "@/http/errors"
+import { DatabaseMiddleware } from "@/services/database.middleware"
 
 /**
  * Users list response schema.
@@ -29,10 +35,12 @@ import { UserCreationError, UserNotFoundError } from "@/http/errors";
 export const UsersListSchema = S.Struct({
   users: S.Array(UserSchema),
   total: S.Number,
-});
+})
 
 /**
  * Users endpoint group definition.
+ *
+ * DatabaseMiddleware provides request-scoped database connections.
  */
 export const UsersGroup = HttpApiGroup.make("users")
   .add(HttpApiEndpoint.get("list", "/").addSuccess(UsersListSchema))
@@ -48,4 +56,5 @@ export const UsersGroup = HttpApiGroup.make("users")
       .addSuccess(UserSchema)
       .addError(UserCreationError),
   )
-  .prefix("/users");
+  .middleware(DatabaseMiddleware)
+  .prefix("/users")

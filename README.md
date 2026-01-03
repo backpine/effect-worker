@@ -1,8 +1,14 @@
 # Effect Worker
 
-An Effect-TS application running on Cloudflare Workers with request-scoped database connections.
+An Effect-TS application running on Cloudflare Workers with request-scoped database connections using `HttpApiMiddleware`.
 
-> **Note**: This is an exploration of patterns for Effect + Cloudflare Workers. The FiberRef approach works, but there may be better patterns. Feedback welcome.
+> **Note:** This project previously used a FiberRef-based approach for request-scoped dependencies. We've since migrated to `HttpApiMiddleware`, which provides a cleaner solution:
+>
+> - **Standard Effect patterns** – Use `yield* DatabaseService` instead of custom accessors
+> - **Compile-time type safety** – Missing middleware causes type errors, not runtime failures
+> - **Granular control** – Apply middleware at the API or group level (not all endpoints need a database)
+>
+> For the original FiberRef approach, see the [fiber-ref-poc branch](https://github.com/backpine/effect-worker/tree/fiber-ref-poc).
 
 ## The Problem
 
@@ -105,33 +111,154 @@ Cloudflare Workers which allows us to improve overall performance.
 
 This isn't about connections going stale - Cloudflare **actively prevents** I/O objects from being shared between requests. The TCP socket opened during Request 1 cannot be used by Request 2. Period.
 
-## Our Solution: FiberRef
+## The Solution: HttpApiMiddleware
 
-FiberRef provides fiber-local storage. Think of it like `AsyncLocalStorage` in Node.js.
+Effect's `HttpApiMiddleware` runs per-request, making it the perfect mechanism for request-scoped services. Unlike layers which are memoized at startup, middleware effects execute fresh for each request.
+
+```
+┌─────────────────────────────────────────────────────┐
+│ ManagedRuntime (built once at startup)              │
+│                                                     │
+│   HttpApiBuilder.api(WorkerApi)  ← Router config    │
+│   HttpApiBuilder.Router.Live     ← Router instance  │
+│   CloudflareBindingsMiddlewareLive ← Middleware impl│
+│   DatabaseMiddlewareLive           ← Middleware impl│
+│                                                     │
+│   Note: Middleware IMPLEMENTATIONS are memoized,    │
+│   but the middleware EFFECTS run per-request!       │
+└─────────────────────────────────────────────────────┘
+                      ↓
+              runtime.runPromise(effect)
+                      ↓
+┌─────────────────────────────────────────────────────┐
+│ Per-Request (via HttpApiMiddleware)                 │
+│                                                     │
+│   CloudflareBindingsMiddleware → yield* effect      │
+│     └─→ Provides { env, ctx } to handlers           │
+│                                                     │
+│   DatabaseMiddleware → yield* effect                │
+│     └─→ Opens TCP connection                        │
+│     └─→ Creates Drizzle instance                    │
+│     └─→ Provides { drizzle } to handlers            │
+│     └─→ Connection closed when request ends         │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+## How It Works
+
+### 1. Define Middleware with `provides`
+
+Middleware uses `HttpApiMiddleware.Tag` with a `provides` option to inject services:
 
 ```typescript
-// Create a FiberRef with null default
-export const currentDrizzle = FiberRef.unsafeMake<DrizzleInstance | null>(null)
+// src/services/database.middleware.ts
 
-// Accessor - dies if null (programming error)
-export const getDrizzle = Effect.gen(function* () {
-  const drizzle = yield* FiberRef.get(currentDrizzle)
-  if (drizzle === null) {
-    return yield* Effect.die("Database not available")
-  }
-  return drizzle
-})
+// Service that middleware will provide
+export class DatabaseService extends Context.Tag("DatabaseService")<
+  DatabaseService,
+  { readonly drizzle: DrizzleInstance }
+>() {}
 
-// Wrapper - sets value for scope of effect
-export const withDatabase = (connectionString: string) =>
-  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const pgClient = yield* PgClient.make({ url: connectionString })
-        const drizzle = yield* PgDrizzle.make()
-        return yield* Effect.locally(currentDrizzle, drizzle)(effect)
-      })
+// Error type with HTTP status annotation
+export class DatabaseConnectionError extends S.TaggedError<DatabaseConnectionError>()(
+  "DatabaseConnectionError",
+  { message: S.String },
+  HttpApiSchema.annotations({ status: 503 }),
+) {}
+
+// Middleware definition
+export class DatabaseMiddleware extends HttpApiMiddleware.Tag<DatabaseMiddleware>()(
+  "DatabaseMiddleware",
+  {
+    failure: DatabaseConnectionError,  // Possible errors
+    provides: DatabaseService,          // Service to inject
+  },
+) {}
+```
+
+### 2. Implement Middleware
+
+The middleware implementation returns an Effect that runs per-request:
+
+```typescript
+export const DatabaseMiddlewareLive = Layer.effect(
+  DatabaseMiddleware,
+  Effect.gen(function* () {
+    // This outer Effect runs once (layer construction)
+    // Return the inner Effect that runs per-request
+    return Effect.gen(function* () {
+      // Read env from FiberRef (set at entry point)
+      const env = yield* FiberRef.get(currentEnv)
+      if (env === null) {
+        return yield* Effect.fail(
+          new DatabaseConnectionError({ message: "Env not available" })
+        )
+      }
+
+      // Create scoped connection (auto-closes when request ends)
+      const pgClient = yield* PgClient.make({
+        url: Redacted.make(env.DATABASE_URL),
+      }).pipe(Effect.provide(Reactivity.layer))
+
+      const drizzle = yield* PgDrizzle.make({
+        casing: "snake_case",
+      }).pipe(Effect.provideService(SqlClient.SqlClient, pgClient))
+
+      return { drizzle }
+    }).pipe(
+      Effect.catchAll((error) =>
+        Effect.fail(new DatabaseConnectionError({
+          message: `Connection failed: ${error}`
+        }))
+      )
     )
+  }),
+)
+```
+
+### 3. Apply Middleware to API/Groups
+
+```typescript
+// src/http/api.ts - Apply at API level
+export class WorkerApi extends HttpApi.make("WorkerApi")
+  .add(HealthGroup)
+  .add(UsersGroup)
+  .middleware(CloudflareBindingsMiddleware)  // Available everywhere
+  .prefix("/api") {}
+
+// src/http/groups/users.definition.ts - Apply at group level
+export const UsersGroup = HttpApiGroup.make("users")
+  .add(HttpApiEndpoint.get("list", "/").addSuccess(UsersListSchema))
+  .middleware(DatabaseMiddleware)  // Only for this group
+  .prefix("/users")
+```
+
+### 4. Access Services in Handlers
+
+Handlers use standard Effect service access - no special patterns needed:
+
+```typescript
+// src/http/groups/users.handlers.ts
+export const UsersGroupLive = HttpApiBuilder.group(
+  WorkerApi,
+  "users",
+  (handlers) =>
+    Effect.gen(function* () {
+      return handlers.handle("list", () =>
+        Effect.gen(function* () {
+          // Standard Effect pattern - type-safe!
+          const { drizzle } = yield* DatabaseService
+
+          const dbUsers = yield* drizzle
+            .select()
+            .from(users)
+
+          return { users: dbUsers, total: dbUsers.length }
+        }),
+      )
+    }),
+)
 ```
 
 ## Request Flow
@@ -139,88 +266,99 @@ export const withDatabase = (connectionString: string) =>
 ```
 fetch(request, env, ctx)
 │
-├─→ withDatabase(env.DATABASE_URL)
-│     └─→ Opens TCP connection
-│         └─→ Sets FiberRef
+├─→ withCloudflareBindings(env, ctx)
+│     └─→ Sets FiberRef (bridge to middleware)
 │
-├─→ withEnv(env)
-│     └─→ Sets FiberRef
-│
-├─→ withCtx(ctx)
-│     └─→ Sets FiberRef
-│
-└─→ handleRequest(request)
+└─→ runtime.runPromise(handleRequest(request))
       │
-      ├─→ Handler calls: yield* getDrizzle
-      │     └─→ Reads from FiberRef
+      ├─→ CloudflareBindingsMiddleware runs
+      │     └─→ Reads FiberRef
+      │     └─→ Provides { env, ctx } via Context
+      │
+      ├─→ DatabaseMiddleware runs
+      │     └─→ Reads env.DATABASE_URL from FiberRef
+      │     └─→ Opens TCP connection (scoped)
+      │     └─→ Provides { drizzle } via Context
+      │
+      ├─→ Handler executes
+      │     └─→ yield* DatabaseService → gets { drizzle }
+      │     └─→ yield* CloudflareBindings → gets { env, ctx }
       │
       └─→ Response returned
-            └─→ Scope ends, TCP connection closed
+            └─→ Request scope ends
+            └─→ TCP connection automatically closed
 ```
 
-## Usage in Handlers
+## Type Safety
+
+The middleware pattern provides compile-time guarantees:
 
 ```typescript
-// src/http/groups/users.handlers.ts
-.handle("list", () =>
-  Effect.gen(function* () {
-    const db = yield* getDrizzle  // Gets request-scoped connection
-    const dbUsers = yield* db.select().from(users)
-    return { users: dbUsers, total: dbUsers.length }
-  })
-)
+// If DatabaseMiddleware isn't applied to the group, this won't compile!
+const { drizzle } = yield* DatabaseService
+//                        ^^^^^^^^^^^^^^^
+// Error: Service 'DatabaseService' is not available in the current context
 ```
 
 ## Entry Point
+
+The entry point is minimal - just bridge Cloudflare bindings to Effect:
 
 ```typescript
 // src/index.ts
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const effect = handleRequest(request).pipe(
-      withDatabase(env.DATABASE_URL ?? LOCAL_DATABASE_URL),
-      withEnv(env),
-      withCtx(ctx),
+      withCloudflareBindings(env, ctx),  // Bridge to Effect
     )
     return runtime.runPromise(effect)
-  }
+  },
 }
 ```
 
-## What Gets Memoized vs Per-Request
+## Key Insight: Middleware Effects vs Layer Effects
 
+The crucial difference is **when** the Effect runs:
+
+| Aspect | Layer.effect | HttpApiMiddleware |
+|--------|-------------|-------------------|
+| **Runs when** | Once at layer construction | Per-request |
+| **Resources** | Memoized, shared | Fresh each request |
+| **Good for** | Static config, routers | Connections, auth |
+| **Scoping** | Application lifetime | Request lifetime |
+
+```typescript
+// Layer: Effect runs ONCE at startup
+const DbLayer = Layer.effect(Database, Effect.gen(function* () {
+  const conn = yield* openConnection()  // Opens once, stays open
+  return conn
+}))
+
+// Middleware: Effect runs PER-REQUEST
+const DbMiddleware = Layer.effect(DatabaseMiddleware, Effect.gen(function* () {
+  return Effect.gen(function* () {      // This inner effect runs per-request
+    const conn = yield* openConnection()  // Opens fresh each request
+    return { drizzle: conn }
+  })
+}))
 ```
-┌─────────────────────────────────────────────────────┐
-│ ManagedRuntime (built once, reused)                 │
-│                                                     │
-│   HttpApiBuilder.api(WorkerApi)  ← Router config    │
-│   HttpApiBuilder.Router.Live     ← Router instance  │
-│   HttpApiBuilder.Middleware.layer                   │
-│   HttpServer.layerContext                           │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-                      ↓
-              runtime.runPromise(effect)
-                      ↓
-┌─────────────────────────────────────────────────────┐
-│ Per-Request (via FiberRef)                          │
-│                                                     │
-│   withDatabase() → getDrizzle                       │
-│   withEnv()      → getEnv                           │
-│   withCtx()      → getCtx                           │
-│                                                     │
-└─────────────────────────────────────────────────────┘
+
+## Why FiberRef is Still Needed
+
+Middleware effects can only access `HttpRouter.Provided` context (request, route params, etc). They cannot depend on other services via `yield* OtherService`.
+
+To pass Cloudflare's `env` and `ctx` from the entry point (outside Effect) into middleware (inside Effect), we use FiberRef as a bridge:
+
+```typescript
+// Entry point sets FiberRef
+withCloudflareBindings(env, ctx)  // Sets currentEnv and currentCtx
+
+// Middleware reads from FiberRef (no service dependency)
+const env = yield* FiberRef.get(currentEnv)  // Works!
+
+// This would NOT work in middleware:
+const { env } = yield* CloudflareBindings  // Creates dependency, breaks middleware
 ```
-
-## Open Questions
-
-1. **Is FiberRef the right pattern?** It works, but feels like we're working around Effect's layer system rather than with it.
-
-2. **Layer.scoped alternative?** Could we create a per-request runtime instead of a shared one? Probably too expensive (rebuilds all layers per request).
-
-3. **Effect.locally gotchas?** Are there edge cases where the FiberRef value doesn't propagate correctly (forked fibers, etc)?
-
-4. **Testing implications?** FiberRef requires wrapping test effects with `withDatabase()` etc. Is there a cleaner way?
 
 ## Development
 
@@ -248,16 +386,69 @@ pnpm test
 
 ```
 src/
-├── index.ts           # Worker entry point, request scoping
-├── runtime.ts         # ManagedRuntime setup
+├── index.ts                        # Worker entry point
+├── runtime.ts                      # ManagedRuntime + middleware layers
 ├── services/
-│   ├── cloudflare.ts  # FiberRef for env/ctx
-│   └── database.ts    # FiberRef for Drizzle
+│   ├── index.ts                    # Re-exports
+│   ├── cloudflare.middleware.ts    # CloudflareBindings middleware
+│   └── database.middleware.ts      # Database middleware
 ├── http/
-│   ├── api.ts         # HttpApi definition
-│   ├── groups/        # Endpoint definitions + handlers
-│   ├── schemas/       # Request/response schemas
-│   └── errors/        # API error types
+│   ├── api.ts                      # HttpApi definition + API-level middleware
+│   ├── groups/
+│   │   ├── *.definition.ts         # Endpoint schemas + group-level middleware
+│   │   └── *.handlers.ts           # Handler implementations
+│   ├── schemas/                    # Request/response schemas
+│   └── errors/                     # API error types
 └── db/
-    └── schema.ts      # Drizzle schema
+    └── schema.ts                   # Drizzle schema
 ```
+
+## Testing
+
+With middleware, testing uses standard Layer composition:
+
+```typescript
+// Mock the middleware
+const MockDatabaseMiddlewareLive = Layer.succeed(
+  DatabaseMiddleware,
+  Effect.succeed({ drizzle: mockDrizzle }),
+)
+
+// Provide mock in tests
+const TestLayer = HttpGroupsLive.pipe(
+  Layer.provide(MockDatabaseMiddlewareLive),
+)
+```
+
+## Comparison: Before and After
+
+### Before (FiberRef Pattern)
+```typescript
+// Custom accessor functions
+const db = yield* getDrizzle   // FiberRef.get + null check
+const env = yield* getEnv      // FiberRef.get + null check
+
+// Entry point wires everything
+effect.pipe(
+  withDatabase(env.DATABASE_URL),
+  withEnv(env),
+  withCtx(ctx),
+)
+```
+
+### After (Middleware Pattern)
+```typescript
+// Standard Effect services
+const { drizzle } = yield* DatabaseService      // Type-safe!
+const { env, ctx } = yield* CloudflareBindings  // Type-safe!
+
+// Entry point is minimal
+effect.pipe(withCloudflareBindings(env, ctx))
+```
+
+| Aspect | FiberRef | Middleware |
+|--------|----------|------------|
+| **Type Safety** | Runtime null checks | Compile-time service requirements |
+| **Error Handling** | Effect.die on null | Typed errors with HTTP status |
+| **Standard Pattern** | Custom accessors | Standard `yield* Service` |
+| **Testing** | Wrap with `withX()` | Provide mock Layer |

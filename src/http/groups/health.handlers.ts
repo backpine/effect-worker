@@ -5,26 +5,19 @@
  *
  * ## Accessing Request-Scoped Services
  *
- * In Cloudflare Workers, we use FiberRef-based accessors instead of the
- * typical Effect Context.Tag pattern:
+ * Services are provided by middleware and accessed via standard Effect pattern:
  *
  * ```typescript
- * // DON'T: Creates layer dependency, breaks ManagedRuntime
- * const drizzle = yield* PgDrizzle.PgDrizzle
- *
- * // DO: Reads from FiberRef, no layer dependency
- * const drizzle = yield* getDrizzle
+ * const { env } = yield* CloudflareBindings
+ * const { drizzle } = yield* DatabaseService
  * ```
- *
- * This is because ManagedRuntime memoizes layers at startup, but Cloudflare
- * bindings and database connections must be created per-request.
  *
  * @module
  */
-import { HttpApiBuilder } from "@effect/platform";
-import { Effect } from "effect";
-import { getEnv } from "@/services";
-import { WorkerApi } from "@/http/api";
+import { HttpApiBuilder } from "@effect/platform"
+import { Effect } from "effect"
+import { CloudflareBindings } from "@/services/cloudflare.middleware"
+import { WorkerApi } from "@/http/api"
 
 /**
  * Health endpoint handler implementation.
@@ -36,14 +29,15 @@ export const HealthGroupLive = HttpApiBuilder.group(
     Effect.gen(function* () {
       return handlers.handle("check", () =>
         Effect.gen(function* () {
-          const env = yield* getEnv;
+          // Access CloudflareBindings service (provided by middleware)
+          const { env } = yield* CloudflareBindings
 
           return {
             status: "ok" as const,
             timestamp: new Date().toISOString(),
             environment: env.ENVIRONMENT || "development",
-          };
+          }
         }),
-      );
+      )
     }),
-);
+)

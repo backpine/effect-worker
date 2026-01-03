@@ -17,25 +17,34 @@
  * handler imports, which would cause a circular dependency since handlers
  * need to reference WorkerApi.
  *
+ * ## Middleware
+ *
+ * Middleware layers are provided at the runtime level (see runtime.ts).
+ * This module only exports handler implementations.
+ *
  * @module
  */
-import { Layer } from "effect";
+import { Layer } from "effect"
 
 // Re-export endpoint definitions (no WorkerApi dependency)
-export { HealthGroup } from "./health.definition";
-export { UsersGroup } from "./users.definition";
+export { HealthGroup } from "./health.definition"
+export { UsersGroup } from "./users.definition"
 
 // Re-export handler implementations (import WorkerApi, no circular dependency)
-export { HealthGroupLive } from "./health.handlers";
-export { UsersGroupLive } from "./users.handlers";
+export { HealthGroupLive } from "./health.handlers"
+export { UsersGroupLive } from "./users.handlers"
 
 // Import handlers for merging
-import { HealthGroupLive } from "./health.handlers";
-import { UsersGroupLive } from "./users.handlers";
+import { HealthGroupLive } from "./health.handlers"
+import { UsersGroupLive } from "./users.handlers"
 
 /**
  * Combined layer of all HTTP group handlers.
  *
+ * Middleware is provided at the runtime level (see runtime.ts).
  * Provide this to HttpApiBuilder.api() to register all endpoint handlers.
  */
-export const HttpGroupsLive = Layer.mergeAll(HealthGroupLive, UsersGroupLive);
+export const HttpGroupsLive = Layer.mergeAll(
+  HealthGroupLive,
+  UsersGroupLive,
+)
