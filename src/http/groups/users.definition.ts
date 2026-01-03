@@ -27,7 +27,7 @@ import {
   CreateUserSchema,
 } from "@/http/schemas"
 import { UserCreationError, UserNotFoundError } from "@/http/errors"
-import { DatabaseMiddleware } from "@/services/database.middleware"
+import { DatabaseMiddleware } from "@/http/middleware"
 
 /**
  * Users list response schema.

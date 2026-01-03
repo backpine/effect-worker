@@ -1,137 +1,84 @@
 /**
- * Cloudflare Request-Scoped Services
+ * Cloudflare Bindings Service
  *
- * Provides access to Cloudflare's `env` and `ExecutionContext` bindings
- * using Effect's FiberRef pattern.
+ * Provides access to Cloudflare's `env` and `ExecutionContext` bindings.
  *
- * ## Why FiberRef Instead of Context.Tag?
+ * ## Usage
  *
- * In a typical Effect application, you'd use Context.Tag + Layer:
- *
+ * In handlers (HTTP or Queue):
  * ```typescript
- * class CloudflareEnv extends Context.Tag("CloudflareEnv")<...>() {
- *   static layer = (env: Env) => Layer.succeed(this, { env })
- * }
+ * const { env, ctx } = yield* CloudflareBindings
+ * const value = await env.MY_KV.get("key")
+ * ctx.waitUntil(backgroundTask())
  * ```
  *
- * This doesn't work with Cloudflare Workers because:
- *
- * 1. **Layer memoization**: ManagedRuntime builds layers at startup, but
- *    Cloudflare bindings aren't available until request time.
- *
- * 2. **Request isolation**: Layers are shared across requests. If we somehow
- *    injected `env` into a layer, all concurrent requests would see the same
- *    env (the first request's env).
- *
- * 3. **Type requirements**: Using Context.Tag in handlers creates a layer
- *    dependency (R type). This prevents using ManagedRuntime.make(ApiLayer)
- *    because the layer would require CloudflareEnv.
- *
- * ## FiberRef Solution
- *
- * FiberRef provides fiber-local storage that works with Effect.locally:
- *
+ * At entry point:
  * ```typescript
- * // Set value for the scope of this effect
- * Effect.locally(currentEnv, env)(myEffect)
- *
- * // Read value inside the effect
- * const env = yield* FiberRef.get(currentEnv)
+ * effect.pipe(withCloudflareBindings(env, ctx))
  * ```
- *
- * This ensures:
- * - Each request has its own isolated env/ctx values
- * - No layer dependencies (handlers have R = never)
- * - ManagedRuntime can be used for static services
  *
  * @module
  */
-import { Effect, FiberRef } from "effect"
+import { Context, Effect, FiberRef, Schema as S } from "effect";
+import { HttpApiSchema } from "@effect/platform";
 
 // ============================================================================
-// FiberRefs for Request-Scoped Data
+// Service Definition
+// ============================================================================
+
+/**
+ * CloudflareBindings service provides access to Cloudflare's env and ctx.
+ */
+export class CloudflareBindings extends Context.Tag("CloudflareBindings")<
+  CloudflareBindings,
+  { readonly env: Env; readonly ctx: ExecutionContext }
+>() {}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/**
+ * Error when Cloudflare bindings are not available.
+ */
+export class CloudflareBindingsError extends S.TaggedError<CloudflareBindingsError>()(
+  "CloudflareBindingsError",
+  { message: S.String },
+  HttpApiSchema.annotations({ status: 500 }),
+) {}
+
+// ============================================================================
+// FiberRef Bridge (Entry Point → Effect Context)
 // ============================================================================
 
 /**
  * FiberRef holding the current request's Cloudflare environment bindings.
- *
- * Contains KV namespaces, D1 databases, R2 buckets, secrets, and other
- * bindings defined in wrangler.toml.
  */
-export const currentEnv = FiberRef.unsafeMake<Env | null>(null)
+export const currentEnv = FiberRef.unsafeMake<Env | null>(null);
 
 /**
  * FiberRef holding the current request's ExecutionContext.
- *
- * Used for ctx.waitUntil() to schedule background work after response.
  */
-export const currentCtx = FiberRef.unsafeMake<ExecutionContext | null>(null)
-
-// ============================================================================
-// Accessors (Use These in Handlers)
-// ============================================================================
+export const currentCtx = FiberRef.unsafeMake<ExecutionContext | null>(null);
 
 /**
- * Get the current Cloudflare environment bindings.
+ * Set Cloudflare bindings for the scope of an effect.
  *
- * Dies if called outside of withEnv() scope (programming error).
+ * Call this at the request/batch boundary in index.ts:
  *
- * @example
  * ```typescript
- * const env = yield* getEnv
- * const value = await env.MY_KV.get("key")
+ * const effect = handleRequest(request).pipe(
+ *   withCloudflareBindings(env, ctx),
+ * )
+ * return runtime.runPromise(effect)
  * ```
  */
-export const getEnv = Effect.gen(function* () {
-  const env = yield* FiberRef.get(currentEnv)
-  if (env === null) {
-    return yield* Effect.die(
-      "Cloudflare env not set. Ensure withEnv() wraps the handler.",
-    )
-  }
-  return env
-})
-
-/**
- * Get the current Cloudflare ExecutionContext.
- *
- * @example
- * ```typescript
- * const ctx = yield* getCtx
- * ctx.waitUntil(backgroundWork())
- * ```
- */
-export const getCtx = Effect.gen(function* () {
-  const ctx = yield* FiberRef.get(currentCtx)
-  if (ctx === null) {
-    return yield* Effect.die(
-      "Cloudflare ctx not set. Ensure withCtx() wraps the handler.",
-    )
-  }
-  return ctx
-})
-
-// ============================================================================
-// Wrappers (Use at Request Boundary)
-// ============================================================================
-
-/**
- * Set Cloudflare env for the scope of an effect.
- *
- * Call this at the request boundary (in index.ts fetch handler).
- */
-export const withEnv = (env: Env) =>
+export const withCloudflareBindings = (env: Env, ctx: ExecutionContext) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    Effect.locally(currentEnv, env)(effect)
-
-/**
- * Set Cloudflare ExecutionContext for the scope of an effect.
- *
- * Call this at the request boundary (in index.ts fetch handler).
- */
-export const withCtx = (ctx: ExecutionContext) =>
-  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    Effect.locally(currentCtx, ctx)(effect)
+    effect.pipe(
+      Effect.locally(currentEnv, env),
+      Effect.locally(currentCtx, ctx),
+    );
 
 // ============================================================================
 // Utilities
@@ -142,30 +89,12 @@ export const withCtx = (ctx: ExecutionContext) =>
  *
  * Uses ctx.waitUntil() to keep the Worker alive while the effect runs.
  * Errors are logged but don't affect the response.
- *
- * ## Cloudflare Worker Lifecycle
- *
- * Normally, a Worker terminates as soon as the Response is returned.
- * ctx.waitUntil() tells Cloudflare to keep the Worker alive until the
- * provided Promise resolves.
- *
- * Common use cases:
- * - Analytics/logging that shouldn't block the response
- * - Cache warming
- * - Webhook notifications
- *
- * @example
- * ```typescript
- * yield* waitUntil(
- *   Effect.gen(function* () {
- *     yield* sendAnalytics(event)
- *   })
- * )
- * ```
  */
-export const waitUntil = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<void> =>
+export const waitUntil = <A, E>(
+  effect: Effect.Effect<A, E>,
+): Effect.Effect<void, never, CloudflareBindings> =>
   Effect.gen(function* () {
-    const ctx = yield* getCtx
+    const { ctx } = yield* CloudflareBindings;
     ctx.waitUntil(
       Effect.runPromise(
         effect.pipe(
@@ -173,5 +102,5 @@ export const waitUntil = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<void
           Effect.catchAll(() => Effect.void),
         ),
       ),
-    )
-  })
+    );
+  });

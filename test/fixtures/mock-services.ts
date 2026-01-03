@@ -6,7 +6,7 @@
  * @module
  */
 import { Effect } from "effect"
-import { withEnv, withCtx } from "@/services"
+import { withCloudflareBindings } from "@/services"
 
 /**
  * Mock Cloudflare Environment for tests.
@@ -39,4 +39,4 @@ export const mockCtx = {
  * ```
  */
 export const withMockCloudflare = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(withEnv(mockEnv), withCtx(mockCtx))
+  effect.pipe(withCloudflareBindings(mockEnv, mockCtx))
