@@ -2,6 +2,14 @@
 
 An Effect-TS application running on Cloudflare Workers with request-scoped database connections using `HttpApiMiddleware`.
 
+> **Note:** This project previously used a FiberRef-based approach for request-scoped dependencies. We've since migrated to `HttpApiMiddleware`, which provides a cleaner solution:
+>
+> - **Standard Effect patterns** – Use `yield* DatabaseService` instead of custom accessors
+> - **Compile-time type safety** – Missing middleware causes type errors, not runtime failures
+> - **Granular control** – Apply middleware at the API or group level (not all endpoints need a database)
+>
+> For the original FiberRef approach, see the [fiber-ref-poc branch](https://github.com/backpine/effect-worker/tree/fiber-ref-poc).
+
 ## The Problem
 
 Cloudflare Workers can't share TCP connections between requests. Each request needs its own database connection that gets created, used, and cleaned up within that request's lifetime.
