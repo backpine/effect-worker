@@ -1,57 +1,31 @@
 /**
- * Request-Scoped Services
+ * Services
  *
- * Provides access to Cloudflare bindings and database connections
- * via HttpApiMiddleware for per-request isolation.
+ * Service definitions (Context.Tag) for dependency injection.
+ * These are the "what" - the contracts that handlers depend on.
  *
- * ## Usage Pattern
- *
- * At request boundary (index.ts):
- * ```typescript
- * effect.pipe(withCloudflareBindings(env, ctx))
- * ```
- *
- * In handlers:
- * ```typescript
- * const { env, ctx } = yield* CloudflareBindings
- * const { drizzle } = yield* DatabaseService
- * ```
+ * For HTTP middleware implementations, see @/http/middleware.
+ * For Queue layer implementations, see @/queue/handler.
  *
  * @module
  */
 
-// Cloudflare bindings middleware
+// Cloudflare bindings service
 export {
   CloudflareBindings,
   CloudflareBindingsError,
-  CloudflareBindingsMiddleware,
-  CloudflareBindingsMiddlewareLive,
   withCloudflareBindings,
   waitUntil,
-  // FiberRef exports (for testing)
   currentEnv,
   currentCtx,
-} from "./cloudflare.middleware"
+} from "./cloudflare";
 
-// Database middleware
+// Database service
 export {
   DatabaseService,
   DatabaseConnectionError,
-  DatabaseMiddleware,
-  DatabaseMiddlewareLive,
+  makeDatabaseConnection,
+  LOCAL_DATABASE_URL,
   PgDrizzle,
   type DrizzleInstance,
-} from "./database.middleware"
-
-// Legacy exports for backwards compatibility (deprecated)
-export {
-  getEnv,
-  getCtx,
-  withEnv,
-  withCtx,
-} from "./cloudflare"
-
-export {
-  getDrizzle,
-  withDatabase,
-} from "./database"
+} from "./database";

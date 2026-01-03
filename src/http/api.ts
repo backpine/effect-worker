@@ -29,7 +29,7 @@ import { HttpApi } from "@effect/platform"
 // Import definitions directly to avoid circular dependency with handlers
 import { HealthGroup } from "@/http/groups/health.definition"
 import { UsersGroup } from "@/http/groups/users.definition"
-import { CloudflareBindingsMiddleware } from "@/services/cloudflare.middleware"
+import { CloudflareBindingsMiddleware } from "@/http/middleware"
 
 /**
  * Worker API definition.

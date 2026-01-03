@@ -152,9 +152,7 @@ Effect's `HttpApiMiddleware` runs per-request, making it the perfect mechanism f
 Middleware uses `HttpApiMiddleware.Tag` with a `provides` option to inject services:
 
 ```typescript
-// src/services/database.middleware.ts
-
-// Service that middleware will provide
+// src/services/database.ts - Service definition
 export class DatabaseService extends Context.Tag("DatabaseService")<
   DatabaseService,
   { readonly drizzle: DrizzleInstance }
@@ -167,7 +165,7 @@ export class DatabaseConnectionError extends S.TaggedError<DatabaseConnectionErr
   HttpApiSchema.annotations({ status: 503 }),
 ) {}
 
-// Middleware definition
+// src/http/middleware/database.ts - Middleware definition
 export class DatabaseMiddleware extends HttpApiMiddleware.Tag<DatabaseMiddleware>()(
   "DatabaseMiddleware",
   {
@@ -316,6 +314,99 @@ export default {
 }
 ```
 
+## Queue Handlers
+
+Cloudflare Queues use a different pattern than HTTP. Instead of `HttpApiMiddleware`, we use `makeQueueHandler` - a factory that creates batch-scoped Effect handlers with automatic ack/retry semantics.
+
+### Why Queues Are Different
+
+- **No HTTP routing** – Single handler per queue, no middleware chain
+- **Batch processing** – Receives `MessageBatch<T>`, not single requests
+- **Ack/retry semantics** – Must signal success or failure per message
+
+### Queue Handler Factory
+
+```typescript
+// src/index.ts
+import { makeQueueHandler } from "@/queue"
+
+export default {
+  fetch: ...,
+
+  queue: makeQueueHandler({
+    schema: MyEventSchema,
+    handler: (event) =>
+      Effect.gen(function* () {
+        const { drizzle } = yield* DatabaseService
+        yield* Effect.log("Processing event", event)
+      }),
+    concurrency: 5,
+  }),
+}
+```
+
+### How It Works
+
+1. **Schema validation** – Messages are decoded with Effect Schema
+2. **Batch-scoped resources** – One DB connection per batch (not per message)
+3. **Automatic ack/retry** – Effect success → `ack()`, failure → `retry()` or dead-letter
+
+```
+queue(batch, env, ctx) called
+│
+├─→ Build batch-scoped layer
+│     ├─→ CloudflareBindings (immediate)
+│     └─→ DatabaseService (opens connection)
+│
+├─→ Effect.forEach(messages, processWithAckRetry)
+│     │
+│     ├─→ Message 1: decode → handler → ack()
+│     ├─→ Message 2: decode → handler → ack()
+│     ├─→ Message 3: decode fails → dead-letter
+│     ├─→ Message 4: handler fails (retryable) → retry()
+│     └─→ Message 5: decode → handler → ack()
+│
+└─→ Batch complete
+      └─→ Database connection closed
+```
+
+### Error Handling
+
+Control retry behavior with `QueueProcessingError.retryable`:
+
+```typescript
+const handleEvent = (event: MyEvent) =>
+  Effect.gen(function* () {
+    // Business validation - don't retry invalid data
+    if (!isValid(event)) {
+      return yield* Effect.fail(
+        new QueueProcessingError({
+          message: "Invalid event",
+          retryable: false,  // Dead-letter
+        }),
+      )
+    }
+
+    // DB operation - retry on transient failures
+    yield* Effect.tryPromise({
+      try: () => db.insert(...),
+      catch: (error) =>
+        new QueueProcessingError({
+          message: "DB insert failed",
+          retryable: true,  // Retry later
+          cause: error,
+        }),
+    })
+  })
+```
+
+| Error Type | Retryable | Action |
+|------------|-----------|--------|
+| Schema decode error | No | Ack (dead-letter) |
+| Business logic error | No | Ack (dead-letter) |
+| Database timeout | Yes | Retry |
+| Network error | Yes | Retry |
+
 ## Key Insight: Middleware Effects vs Layer Effects
 
 The crucial difference is **when** the Effect runs:
@@ -386,19 +477,27 @@ pnpm test
 
 ```
 src/
-├── index.ts                        # Worker entry point
-├── runtime.ts                      # ManagedRuntime + middleware layers
+├── index.ts                        # Worker entry point (fetch + queue)
+├── runtime.ts                      # ManagedRuntime for HTTP
 ├── services/
 │   ├── index.ts                    # Re-exports
-│   ├── cloudflare.middleware.ts    # CloudflareBindings middleware
-│   └── database.middleware.ts      # Database middleware
+│   ├── cloudflare.ts               # CloudflareBindings service + FiberRef bridge
+│   └── database.ts                 # DatabaseService + makeDatabaseConnection
 ├── http/
-│   ├── api.ts                      # HttpApi definition + API-level middleware
+│   ├── api.ts                      # HttpApi definition
+│   ├── middleware/
+│   │   ├── cloudflare.ts           # CloudflareBindingsMiddleware (HTTP)
+│   │   └── database.ts             # DatabaseMiddleware (HTTP)
 │   ├── groups/
-│   │   ├── *.definition.ts         # Endpoint schemas + group-level middleware
+│   │   ├── *.definition.ts         # Endpoint schemas + group middleware
 │   │   └── *.handlers.ts           # Handler implementations
 │   ├── schemas/                    # Request/response schemas
 │   └── errors/                     # API error types
+├── queue/
+│   ├── index.ts                    # Re-exports
+│   ├── handler.ts                  # makeQueueHandler factory
+│   ├── errors.ts                   # Queue error types
+│   └── handlers/                   # Queue handler implementations
 └── db/
     └── schema.ts                   # Drizzle schema
 ```

@@ -41,8 +41,10 @@
  *
  * @module
  */
-import { runtime, handleRequest, openApiSpec } from "@/runtime"
-import { withCloudflareBindings } from "@/services/cloudflare.middleware"
+import { runtime, handleRequest, openApiSpec } from "@/runtime";
+import { withCloudflareBindings } from "@/services/cloudflare";
+import { makeQueueHandler } from "@/queue";
+import { ExampleEvent, handleExampleEvent } from "@/queue/handlers/example";
 
 /**
  * Cloudflare Worker fetch handler.
@@ -51,19 +53,24 @@ import { withCloudflareBindings } from "@/services/cloudflare.middleware"
  */
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(request.url)
+    const url = new URL(request.url);
 
     // Serve OpenAPI spec at /api/openapi.json
     if (url.pathname === "/api/openapi.json") {
-      return Response.json(openApiSpec)
+      return Response.json(openApiSpec);
     }
 
     // Handle request with Cloudflare bindings available via FiberRef
     // Middleware handles database connection per-request
     const effect = handleRequest(request).pipe(
       withCloudflareBindings(env, ctx),
-    )
+    );
 
-    return runtime.runPromise(effect)
+    return runtime.runPromise(effect);
   },
-}
+  queue: makeQueueHandler({
+    schema: ExampleEvent,
+    handler: handleExampleEvent,
+    concurrency: 5,
+  }),
+} satisfies ExportedHandler<Env>;

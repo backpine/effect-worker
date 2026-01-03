@@ -16,7 +16,7 @@
  */
 import { HttpApiBuilder } from "@effect/platform"
 import { Effect } from "effect"
-import { CloudflareBindings } from "@/services/cloudflare.middleware"
+import { CloudflareBindings } from "@/services/cloudflare"
 import { WorkerApi } from "@/http/api"
 
 /**

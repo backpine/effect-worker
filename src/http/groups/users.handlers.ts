@@ -11,7 +11,7 @@ import { DateTime, Effect } from "effect"
 import { UserId, Email, User } from "@/http/schemas"
 import { UserCreationError, UserNotFoundError } from "@/http/errors"
 import { WorkerApi } from "@/http/api"
-import { DatabaseService } from "@/services/database.middleware"
+import { DatabaseService } from "@/services/database"
 import { users } from "@/db"
 import { eq } from "drizzle-orm"
 
