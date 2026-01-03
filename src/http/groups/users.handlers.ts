@@ -11,9 +11,10 @@ import { DateTime, Effect } from "effect";
 import { UserId, Email, User } from "@/http/schemas";
 import { UserCreationError, UserNotFoundError } from "@/http/errors";
 import { WorkerApi } from "@/http/api";
-import { getDrizzle } from "@/services/database";
+import { getDrizzle, withDatabase } from "@/services/database";
 import { users } from "@/db";
 import { eq } from "drizzle-orm";
+import { env } from "cloudflare:workers";
 
 /**
  * Convert database user id to UserId format.
@@ -58,6 +59,7 @@ export const UsersGroupLive = HttpApiBuilder.group(
             };
           }),
         )
+
         .handle("get", ({ path: { id } }) =>
           Effect.gen(function* () {
             const dbId = parseUserId(id);
@@ -117,9 +119,7 @@ export const UsersGroupLive = HttpApiBuilder.group(
               );
 
             if (!newUser) {
-              return yield* Effect.fail(
-                new UserCreationError({ email, name }),
-              );
+              return yield* Effect.fail(new UserCreationError({ email, name }));
             }
 
             return {
