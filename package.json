@@ -16,11 +16,14 @@
     "db:down": "docker compose down",
     "db:push": "DATABASE_URL=postgres://postgres:postgres@localhost:5432/effect_worker drizzle-kit push",
     "db:seed": "npx tsx scripts/seed.ts",
-    "db:studio": "DATABASE_URL=postgres://postgres:postgres@localhost:5432/effect_worker drizzle-kit studio"
+    "db:studio": "DATABASE_URL=postgres://postgres:postgres@localhost:5432/effect_worker drizzle-kit studio",
+    "rpc:client": "npx tsx scripts/rpc-client.ts"
   },
   "dependencies": {
     "@effect/experimental": "^0.58.0",
     "@effect/platform": "^0.94.1",
+    "@effect/platform-node": "^0.104.0",
+    "@effect/rpc": "^0.73.0",
     "@effect/sql": "^0.49.0",
     "@effect/sql-drizzle": "^0.48.0",
     "@effect/sql-pg": "^0.50.0",
